@@ -1,8 +1,16 @@
-// main.rs
+mod domain;
+mod infrastructure;
 
-// Orquestador de Bot de Telegram para Scraping de Precio del Cafe de Colombia
-//https://federaciondecafeteros.org/wp/publicaciones/
+use infrastructure::providers::mock_provider::MockCoffeePriceProvider;
+use domain::traits::coffee_price_provider::CoffeePriceProvider;
 
-fn main() {
-    println!("Hello, world!");
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let provider = MockCoffeePriceProvider;
+
+    let price = provider.get_price().await?;
+
+    println!("Precio del café: {:?}", price);
+
+    Ok(())
 }
