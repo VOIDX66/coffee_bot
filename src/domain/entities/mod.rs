@@ -1,1 +1,1 @@
-pub mod coffee_price;
+pub mod coffee_market_indicators;

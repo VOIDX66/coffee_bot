@@ -1,1 +1,1 @@
-pub mod get_coffee_price;
+pub mod get_coffee_market_indicators;

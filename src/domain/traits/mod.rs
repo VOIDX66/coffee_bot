@@ -1,2 +1,3 @@
-pub mod coffee_price_provider;
 pub mod cache_repository;
+pub mod coffee_market_provider;
+pub mod clock;
