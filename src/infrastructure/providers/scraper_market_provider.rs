@@ -1,119 +1,152 @@
-// scraper_market_provider.rs
-/*
-  Scraper para obtener los indicadores del mercado del café
-*/
-
-use anyhow::{anyhow, Result};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use chrono::NaiveDate;
-use reqwest::Client;
+use reqwest::{Client, header};
 use scraper::{Html, Selector};
+use std::sync::Arc;
 
 use crate::domain::entities::coffee_market_indicators::CoffeeMarketIndicators;
 use crate::domain::traits::coffee_market_provider::CoffeeMarketProvider;
 
+// Actualizamos los selectores para la nueva estructura de Elementor
+struct ScraperSelectors {
+    menu_item: Selector,
+    title: Selector,
+    content: Selector,
+}
+
 pub struct ScraperCoffeeMarketProvider {
     client: Client,
+    selectors: Arc<ScraperSelectors>,
 }
 
 impl ScraperCoffeeMarketProvider {
     pub fn new() -> Self {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            header::USER_AGENT,
+            header::HeaderValue::from_static(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            ),
+        );
+
+        let client = Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap_or_else(|_| Client::new());
+
+        let selectors = ScraperSelectors {
+            // Cada bloque de indicador en el nuevo diseño
+            menu_item: Selector::parse(".e-n-menu-item").expect("Invalid menu item selector"),
+            // El span que tiene el texto ej: "Precio interno de referencia: $2.220.000"
+            title: Selector::parse(".e-n-menu-title-text").expect("Invalid title selector"),
+            // El div desplegable que contiene la fecha
+            content: Selector::parse(".e-n-menu-content").expect("Invalid content selector"),
+        };
+
         Self {
-            client: Client::new(),
+            client,
+            selectors: Arc::new(selectors),
         }
     }
 
     fn parse_money(value: &str) -> Result<f64> {
-        // Elimina símbolo $
-        let cleaned = value.trim().replace("$", "");
+        // La lógica se mantiene igual de robusta:
+        // Solo conservamos números y la coma (para decimales)
+        let cleaned: String = value
+            .chars()
+            .filter(|c| c.is_digit(10) || *c == ',')
+            .collect();
 
-        // Quita separadores de miles (.)
-        let no_thousands = cleaned.replace(".", "");
+        let normalized = cleaned.replace(",", ".");
 
-        // Reemplaza coma decimal por punto
-        let normalized = no_thousands.replace(",", ".");
-
-        Ok(normalized.parse::<f64>()?)
+        normalized
+            .parse::<f64>()
+            .with_context(|| format!("No se pudo parsear el valor numérico: {}", value))
     }
 }
 
 #[async_trait]
 impl CoffeeMarketProvider for ScraperCoffeeMarketProvider {
     async fn get_market_indicators(&self) -> Result<CoffeeMarketIndicators> {
-        let url = "https://federaciondecafeteros.org/wp/";
+        // Nota: Según el HTML que pasaste, la URL correcta ahora podría ser esta:
+        let url = "https://federaciondecafeteros.org/publicaciones/";
 
-        let response = self.client
+        let response = self
+            .client
             .get(url)
             .send()
-            .await?
+            .await
+            .context("Error al conectar con la web de la Federación")?
             .text()
             .await?;
 
         let document = Html::parse_document(&response);
 
-        let li_selector =
-            Selector::parse("#modal-indicadores .lista li")
-                .map_err(|_| anyhow!("Selector inválido"))?;
+        let mut publication_date = None;
+        let mut internal_price = None;
+        let mut pasilla = None;
+        let mut ny_price = None;
+        let mut exchange_rate = None;
+        let mut mecic = None;
 
-        let name_selector =
-            Selector::parse(".name")
-                .map_err(|_| anyhow!("Selector inválido"))?;
+        for item in document.select(&self.selectors.menu_item) {
+            // 1. Parsear el Nombre y el Valor (Vienen juntos en el title)
+            if let Some(title_elem) = item.select(&self.selectors.title).next() {
+                let full_title = title_elem.inner_html().trim().to_string();
 
-        let value_selector =
-            Selector::parse("strong")
-                .map_err(|_| anyhow!("Selector inválido"))?;
+                // Dividimos el texto por los dos puntos ":"
+                let parts: Vec<&str> = full_title.split(':').collect();
+                if parts.len() >= 2 {
+                    let name = parts[0].trim();
+                    let value = parts[1..].join(":").trim().to_string(); // En caso de que haya más ":"
 
-        let mut publication_date: Option<NaiveDate> = None;
-        let mut internal_price: Option<f64> = None;
-        let mut pasilla: Option<f64> = None;
-        let mut ny_price: Option<f64> = None;
-        let mut exchange_rate: Option<f64> = None;
-        let mut mecic: Option<f64> = None;
+                    match name {
+                        n if n.contains("Precio interno") => {
+                            internal_price = Some(Self::parse_money(&value)?)
+                        }
+                        n if n.contains("Bolsa de NY") => {
+                            ny_price = Some(Self::parse_money(&value)?)
+                        }
+                        n if n.contains("Tasa de cambio") => {
+                            exchange_rate = Some(Self::parse_money(&value)?)
+                        }
+                        n if n.contains("MeCIC") => mecic = Some(Self::parse_money(&value)?),
+                        n if n.contains("Pasilla") => pasilla = Some(Self::parse_money(&value)?),
+                        _ => {}
+                    }
+                }
+            }
 
-        for li in document.select(&li_selector) {
-            let name = li
-                .select(&name_selector)
-                .next()
-                .map(|n| n.text().collect::<Vec<_>>().join("").trim().to_string());
+            // 2. Extraer la fecha del contenido interno (Buscamos la palabra "Fecha:")
+            // Solo lo hacemos si no la hemos encontrado todavía
+            if publication_date.is_none() {
+                if let Some(content_elem) = item.select(&self.selectors.content).next() {
+                    let content_text = content_elem.text().collect::<Vec<_>>().join(" ");
 
-            let value = li
-                .select(&value_selector)
-                .next()
-                .map(|v| v.text().collect::<Vec<_>>().join("").trim().to_string());
-
-            if let (Some(name), Some(value)) = (name, value) {
-                match name.as_str() {
-                    "Fecha:" => {
-                        publication_date =
-                            Some(NaiveDate::parse_from_str(&value, "%Y-%m-%d")?);
+                    if let Some(idx) = content_text.find("Fecha:") {
+                        // Tomamos lo que sigue de "Fecha:", quitamos espacios y extraemos la primera palabra (la fecha en sí)
+                        let date_str = content_text[idx + 6..]
+                            .trim()
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("");
+                        if let Ok(date) = NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+                            publication_date = Some(date);
+                        }
                     }
-                    "Precio interno de referencia:" => {
-                        internal_price = Some(Self::parse_money(&value)?);
-                    }
-                    "Pasilla de finca:" => {
-                        pasilla = Some(Self::parse_money(&value)?);
-                    }
-                    "Bolsa de NY:" => {
-                        ny_price = Some(Self::parse_money(&value)?);
-                    }
-                    "Tasa de cambio:" => {
-                        exchange_rate = Some(Self::parse_money(&value)?);
-                    }
-                    "MeCIC:" => {
-                        mecic = Some(Self::parse_money(&value)?);
-                    }
-                    _ => {}
                 }
             }
         }
 
-        if publication_date.is_none() || internal_price.is_none() {
-            return Err(anyhow!("Sitio en mantenimiento o datos no disponibles"));
-        }
+        // Validación de datos mínimos requeridos
+        let date =
+            publication_date.ok_or_else(|| anyhow!("No se encontró la fecha de publicación"))?;
+        let price = internal_price.ok_or_else(|| anyhow!("No se encontró el precio interno"))?;
 
         Ok(CoffeeMarketIndicators::new(
-            publication_date.ok_or_else(|| anyhow!("Falta Fecha"))?,
-            internal_price.ok_or_else(|| anyhow!("Falta Precio interno"))?,
+            date,
+            price,
             pasilla.unwrap_or(0.0),
             ny_price.unwrap_or(0.0),
             exchange_rate.unwrap_or(0.0),
