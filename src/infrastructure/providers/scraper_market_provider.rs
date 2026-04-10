@@ -107,6 +107,10 @@ impl CoffeeMarketProvider for ScraperCoffeeMarketProvider {
             }
         }
 
+        if publication_date.is_none() || internal_price.is_none() {
+            return Err(anyhow!("Sitio en mantenimiento o datos no disponibles"));
+        }
+
         Ok(CoffeeMarketIndicators::new(
             publication_date.ok_or_else(|| anyhow!("Falta Fecha"))?,
             internal_price.ok_or_else(|| anyhow!("Falta Precio interno"))?,
